@@ -1,0 +1,506 @@
+import { useState, useRef, useCallback } from "react";
+
+const SERVICE_UUID = "0000fe95-0000-1000-8000-00805f9b34fb";
+const WRITE_SHORTS = [0x0010, 0x0016, 0x0018, 0x001a, 0x001b, 0x001c];
+
+function toArr(dv: DataView | null | undefined): Uint8Array {
+  if (!dv) return new Uint8Array(0);
+  return new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+}
+function shortId(uuid: string): number {
+  const s = uuid.toLowerCase().replace(/-/g, "").replace(/^0x/, "");
+  if (s.length <= 4) return parseInt(s, 16);
+  if (s.length === 8) return parseInt(s.slice(4), 16);
+  return parseInt(s.slice(4, 8), 16);
+}
+function shortLabel(uuid: string): string {
+  const n = shortId(uuid);
+  return isNaN(n) ? uuid.slice(0, 8).toUpperCase() : n.toString(16).toUpperCase().padStart(4, "0");
+}
+function hexStr(a: Uint8Array): string {
+  return Array.from(a).map(b => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
+}
+function dreameSpeedPkt(raw: number): Uint8Array {
+  return new Uint8Array([0xff, 0x02, raw & 0xff, 0x02]);
+}
+function dreameReadPkt(reg: number): Uint8Array {
+  return new Uint8Array([0xff, 0x01, reg & 0xff, 0x00]);
+}
+function kmhToRaw(kmh: number): number {
+  return Math.round(Math.max(0x50, Math.min(0x78, kmh * 2.57)));
+}
+function rawToKmh(raw: number): number {
+  return Math.round(raw / 2.57);
+}
+function interpretResponse(hex: string): string {
+  const b = hex.trim().split(" ").map(h => parseInt(h, 16));
+  if (b.length < 3) return "";
+  if (b[0] === 0xff && b[1] === 0x02) {
+    if (b[2] === 0x55) return "✅ ACK";
+    if (b[2] === 0xff) return "❌ NACK";
+    return `📊 ${rawToKmh(b[2])} km/h`;
+  }
+  return "";
+}
+const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+interface Preset { id: string; label: string; icon: string; kmh: number; color: string; desc: string; }
+const PRESETS: Preset[] = [
+  { id: "eco",   label: "Eco",   icon: "🌿", kmh: 20, color: "#3fb950", desc: "Sparsam" },
+  { id: "legal", label: "Legal", icon: "📋", kmh: 25, color: "#58a6ff", desc: "DE legal" },
+  { id: "sport", label: "Sport", icon: "⚡", kmh: 33, color: "#f0883e", desc: "Original" },
+  { id: "turbo", label: "Turbo", icon: "🚀", kmh: 38, color: "#bc8cff", desc: "Entsperrt" },
+];
+
+type Phase = "idle"|"connecting"|"connected"|"busy";
+type Tab = "modes"|"custom"|"info"|"dev";
+interface LogEntry { text: string; type: "tx"|"rx"|"info"|"ok"|"err"|"warn"; }
+
+export default function App() {
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [tab, setTab] = useState<Tab>("modes");
+  const [activePreset, setActivePreset] = useState<string|null>(null);
+  const [speed, setSpeed] = useState(33);
+  const [battery, setBattery] = useState<number|null>(null);
+  const [log, setLog] = useState<LogEntry[]>([]);
+  const [hexInput, setHexInput] = useState("FF 02 55 02");
+  const [gattInfo, setGattInfo] = useState<{label:string;value:string}[]>([]);
+  const [modelName, setModelName] = useState<string|null>(null);
+  const [lastResponse, setLastResponse] = useState<string|null>(null);
+  const [sweepResult, setSweepResult] = useState<{raw:number;kmh:number}[]>([]);
+
+  const wChars = useRef<BluetoothRemoteGATTCharacteristic[]>([]);
+  const rxQueue = useRef<string[]>([]);
+  const c001c = useRef<BluetoothRemoteGATTCharacteristic|null>(null);
+  const logEndRef = useRef<HTMLDivElement>(null);
+
+  const addLog = useCallback((text: string, type: LogEntry["type"] = "info") => {
+    setLog(p => [...p.slice(-800), { text, type }]);
+    setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+  }, []);
+
+  async function doWrite(c: BluetoothRemoteGATTCharacteristic, data: Uint8Array) {
+    const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    try {
+      if (c.properties.writeWithoutResponse) await c.writeValueWithoutResponse(buf);
+      else await c.writeValue(buf);
+    } catch (e: any) { addLog(`Write-Fehler: ${e?.message ?? e}`, "warn"); }
+  }
+
+  async function writeAll(data: Uint8Array) {
+    for (const c of wChars.current) await doWrite(c, data);
+  }
+
+  async function connect() {
+    if (!("bluetooth" in navigator)) { addLog("❌ Bluefy benutzen!", "err"); return; }
+    setPhase("connecting"); setLog([]); wChars.current = []; rxQueue.current = [];
+    c001c.current = null; setGattInfo([]); setModelName(null); setLastResponse(null);
+    addLog("Scooter suchen...", "info");
+    let device: BluetoothDevice;
+    try {
+      device = await (navigator as any).bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: [SERVICE_UUID, "device_information", "battery_service"],
+      });
+    } catch { addLog("Abgebrochen", "err"); setPhase("idle"); return; }
+    addLog(`Gerät: ${device.name ?? "Unbekannt"}`, "ok");
+    if (device.name) setModelName(device.name);
+    let server: BluetoothRemoteGATTServer;
+    try { server = await device.gatt!.connect(); }
+    catch (e: any) { addLog(`GATT Fehler: ${e?.message}`, "err"); setPhase("idle"); return; }
+    addLog("GATT verbunden", "ok");
+    device.addEventListener("gattserverdisconnected", () => {
+      addLog("Getrennt", "warn"); setPhase("idle"); setModelName(null);
+    });
+    try {
+      const bSvc = await server.getPrimaryService("battery_service");
+      const bChar = await bSvc.getCharacteristic("battery_level");
+      const bVal = await bChar.readValue();
+      setBattery(bVal.getUint8(0));
+      addLog(`🔋 ${bVal.getUint8(0)}%`, "ok");
+    } catch { addLog("Batterie: nicht lesbar", "info"); }
+    try {
+      const diSvc = await server.getPrimaryService("device_information");
+      const diMap = [
+        { label: "Modell", uuid: "model_number_string" },
+        { label: "Serial", uuid: "serial_number_string" },
+        { label: "Firmware", uuid: "firmware_revision_string" },
+        { label: "Hardware", uuid: "hardware_revision_string" },
+        { label: "Hersteller", uuid: "manufacturer_name_string" },
+      ];
+      const gathered: {label:string;value:string}[] = [];
+      for (const { label, uuid } of diMap) {
+        try {
+          const ch = await diSvc.getCharacteristic(uuid);
+          const val = await ch.readValue();
+          const str = new TextDecoder().decode(val).replace(/\0/g,"").trim();
+          if (str) { gathered.push({ label, value: str }); addLog(`ℹ️ ${label}: ${str}`, "ok"); }
+        } catch {}
+      }
+      if (gathered.length) { setGattInfo(gathered); const m = gathered.find(g=>g.label==="Modell")?.value; if(m) setModelName(m); }
+      else addLog("Device Info: nicht verfügbar", "info");
+    } catch { addLog("Device Info: nicht verfügbar", "info"); }
+    let service: BluetoothRemoteGATTService|null = null;
+    try { service = await server.getPrimaryService(SERVICE_UUID); } catch {}
+    if (!service) try { service = await server.getPrimaryService(0xfe95); } catch {}
+    if (!service) { addLog("FE95-Service fehlt", "err"); setPhase("idle"); return; }
+    const cList = await service.getCharacteristics();
+    const found: BluetoothRemoteGATTCharacteristic[] = [];
+    for (const c of cList) {
+      const sid = shortId(c.uuid);
+      const lbl = shortLabel(c.uuid);
+      if (WRITE_SHORTS.includes(sid) && (c.properties.write || c.properties.writeWithoutResponse)) {
+        found.push(c);
+        if (sid === 0x001c) c001c.current = c;
+      }
+      if (c.properties.notify || c.properties.indicate) {
+        try {
+          await c.startNotifications();
+          c.addEventListener("characteristicvaluechanged", (e: Event) => {
+            const arr = toArr((e.target as BluetoothRemoteGATTCharacteristic).value);
+            if (arr.length > 0) {
+              const h = hexStr(arr);
+              rxQueue.current.push(h);
+              const interp = interpretResponse(h);
+              addLog(`← ${lbl}: ${h}${interp ? "  "+interp : ""}`, "rx");
+              setLastResponse(h);
+            }
+          });
+        } catch {}
+      }
+    }
+    if (!found.length) { addLog("Keine Write-Chars", "err"); setPhase("idle"); return; }
+    addLog(`${found.length} Chars: ${found.map(c=>shortLabel(c.uuid)).join(", ")}`, "ok");
+    wChars.current = found;
+    setPhase("connected");
+  }
+
+  async function applySpeed(kmh: number, label: string) {
+    if (phase !== "connected") return;
+    setPhase("busy");
+    const raw = kmhToRaw(kmh);
+    addLog(`${label}: ${kmh} km/h → raw 0x${raw.toString(16).toUpperCase()}`, "info");
+    rxQueue.current = [];
+    const pkt = dreameSpeedPkt(raw);
+    addLog(`→ ${hexStr(pkt)}`, "tx");
+    await writeAll(pkt);
+    await delay(400);
+    for (const offset of [-1, 1]) {
+      await writeAll(dreameSpeedPkt(raw + offset));
+      await delay(250);
+    }
+    addLog(`${label} gesetzt!`, "ok");
+    setPhase("connected");
+  }
+
+  async function applyPreset(p: Preset) { setActivePreset(p.id); await applySpeed(p.kmh, p.label); }
+  async function applyCustom() { setActivePreset(null); await applySpeed(speed, "Custom"); }
+
+  async function doSweep() {
+    if (!c001c.current || phase !== "connected") return;
+    setPhase("busy"); setSweepResult([]);
+    addLog("🔍 Smart Sweep 0x50→0x78...", "info");
+    const results: {raw:number;kmh:number}[] = [];
+    for (let v = 0x50; v <= 0x78; v++) {
+      rxQueue.current = [];
+      await doWrite(c001c.current, dreameSpeedPkt(v));
+      await delay(280);
+      const resp = rxQueue.current[0] ?? "";
+      if (resp.includes("55") && !resp.includes("FF 02 FF")) {
+        results.push({ raw: v, kmh: rawToKmh(v) });
+        addLog(`✅ 0x${v.toString(16).toUpperCase()} = ${rawToKmh(v)} km/h ACK`, "ok");
+      }
+    }
+    setSweepResult(results);
+    if (results.length) addLog(`🎯 Max: ${results[results.length-1].kmh} km/h`, "ok");
+    else addLog("⚠️ Kein ACK — Firmware gelockt", "warn");
+    addLog("Sweep fertig.", "ok");
+    setPhase("connected");
+  }
+
+  async function registerScan() {
+    if (!c001c.current || phase !== "connected") return;
+    setPhase("busy");
+    addLog("📖 Register-Scan 00→1F...", "info");
+    for (let r = 0; r <= 0x1f; r++) {
+      await doWrite(c001c.current, dreameReadPkt(r));
+      await delay(320);
+    }
+    addLog("Scan fertig.", "ok");
+    setPhase("connected");
+  }
+
+  async function sendHex() {
+    if (phase !== "connected") return;
+    const bytes = hexInput.trim().split(/\s+/).map(h=>parseInt(h,16)).filter(n=>!isNaN(n));
+    if (!bytes.length) return;
+    setPhase("busy");
+    const data = new Uint8Array(bytes);
+    addLog(`→ ${hexStr(data)}`, "tx");
+    rxQueue.current = [];
+    if (c001c.current) await doWrite(c001c.current, data);
+    else await writeAll(data);
+    await delay(400);
+    setPhase("connected");
+  }
+
+  async function monitor() {
+    if (phase !== "connected") return;
+    setPhase("busy");
+    addLog("👂 Monitor 8s...", "info");
+    rxQueue.current = [];
+    await delay(8000);
+    addLog(rxQueue.current.length > 0 ? `${rxQueue.current.length} Nachrichten!` : "Keine spontanen Nachrichten.", "ok");
+    setPhase("connected");
+  }
+
+  const connected = phase === "connected";
+  const busy = phase === "busy" || phase === "connecting";
+  const TABS = [
+    { id: "modes" as Tab, label: "⚡ Modi" },
+    { id: "custom" as Tab, label: "🎛 Custom" },
+    { id: "info" as Tab, label: "🔥 Info" },
+    { id: "dev" as Tab, label: "🔧 Dev" },
+  ];
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0d1117", color:"#e6edf3",
+      fontFamily:"'SF Mono','Fira Code',monospace",
+      display:"flex", flexDirection:"column", alignItems:"center",
+      padding:"0 0 60px", boxSizing:"border-box" }}>
+      <div style={{ width:"100%", background:"#0d1117", borderBottom:"1px solid #21262d",
+        padding:"14px 18px", boxSizing:"border-box",
+        display:"flex", alignItems:"center", justifyContent:"space-between",
+        position:"sticky", top:0, zIndex:10 }}>
+        <div>
+          <div style={{ fontSize:17, fontWeight:800 }}>
+            <span style={{ color:"#58a6ff" }}>▶</span>
+            <span style={{ marginLeft:6 }}>Dreame</span>
+            <span style={{ color:"#484f58" }}> Tuner</span>
+          </div>
+          <div style={{ fontSize:10, color:"#484f58", marginTop:1 }}>
+            v3.0 · FF02 Native · {modelName ? <span style={{color:"#58a6ff"}}>{modelName}</span> : "kein Gerät"}
+          </div>
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          {battery !== null && <span style={{ fontSize:11, color:battery>20?"#3fb950":"#f85149", fontWeight:700 }}>🔋{battery}%</span>}
+          <div style={{ width:8, height:8, borderRadius:"50%",
+            background:connected?"#3fb950":busy?"#e3b341":"#484f58" }} />
+        </div>
+      </div>
+
+      <div style={{ width:"100%", maxWidth:480, padding:"12px 14px 0", boxSizing:"border-box" }}>
+        <button onClick={connect} disabled={busy} style={{
+          width:"100%", padding:"13px 0", fontSize:14, fontWeight:700,
+          background:connected?"#0d2016":busy?"#161b22":"#1f6feb",
+          color:connected?"#3fb950":busy?"#8b949e":"#fff",
+          border:`2px solid ${connected?"#3fb950":busy?"#30363d":"#388bfd"}`,
+          borderRadius:12, cursor:busy?"not-allowed":"pointer", marginBottom:10 }}>
+          {phase==="connecting"?"⏳ Verbinde...":connected?`✓ ${modelName??"Verbunden"}`:"🔵 Verbinden"}
+        </button>
+
+        {lastResponse && connected && (
+          <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:8,
+            padding:"6px 12px", marginBottom:10, fontSize:11,
+            display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <span style={{color:"#484f58"}}>Antwort:</span>
+            <span style={{color:"#bc8cff", fontFamily:"monospace", fontWeight:700}}>{lastResponse}</span>
+            <span style={{color:lastResponse.includes("55")&&!lastResponse.includes("FF 02 FF")?"#3fb950":"#f85149", fontSize:10}}>
+              {lastResponse.includes("55")&&!lastResponse.includes("FF 02 FF")?"ACK ✅":"NACK ❌"}
+            </span>
+          </div>
+        )}
+
+        <div style={{ display:"flex", gap:3, marginBottom:14, background:"#161b22",
+          borderRadius:10, padding:4, border:"1px solid #21262d" }}>
+          {TABS.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              flex:1, padding:"7px 0", fontSize:11, fontWeight:600,
+              background:tab===t.id?"#21262d":"transparent",
+              color:tab===t.id?"#e6edf3":"#8b949e",
+              border:"none", borderRadius:7, cursor:"pointer" }}>{t.label}</button>
+          ))}
+        </div>
+
+        {tab === "modes" && (
+          <div>
+            <div style={{ fontSize:10, color:"#484f58", textAlign:"center", marginBottom:10 }}>
+              FF 02 &lt;raw&gt; 02 · ACK = FF 02 55 02
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:12 }}>
+              {PRESETS.map(p => (
+                <button key={p.id} onClick={() => applyPreset(p)} disabled={!connected||busy} style={{
+                  background:activePreset===p.id?`${p.color}18`:"#161b22",
+                  border:`2px solid ${activePreset===p.id?p.color:"#30363d"}`,
+                  borderRadius:14, padding:"16px 10px",
+                  cursor:(!connected||busy)?"not-allowed":"pointer", textAlign:"center",
+                  boxShadow:activePreset===p.id?`0 0 14px ${p.color}44`:"none" }}>
+                  <div style={{fontSize:26}}>{p.icon}</div>
+                  <div style={{fontSize:14, fontWeight:800, color:p.color, marginTop:3}}>{p.label}</div>
+                  <div style={{fontSize:22, fontWeight:900, color:"#e6edf3", margin:"3px 0"}}>
+                    {p.kmh} <span style={{fontSize:11, color:"#8b949e"}}>km/h</span>
+                  </div>
+                  <div style={{fontSize:10, color:"#484f58", fontFamily:"monospace"}}>
+                    0x{kmhToRaw(p.kmh).toString(16).toUpperCase()}
+                  </div>
+                </button>
+              ))}
+            </div>
+            {sweepResult.length > 0 && (
+              <div style={{ background:"#0d2016", border:"1px solid #3fb950", borderRadius:10,
+                padding:"12px 14px", marginBottom:10 }}>
+                <div style={{fontSize:11, fontWeight:700, color:"#3fb950", marginBottom:8}}>
+                  ✅ Sweep: {sweepResult.length} ACK-Werte gefunden
+                </div>
+                <div style={{display:"flex", flexWrap:"wrap", gap:5}}>
+                  {sweepResult.map(r => (
+                    <button key={r.raw} onClick={() => applySpeed(r.kmh, `${r.kmh}km/h`)}
+                      disabled={!connected||busy} style={{
+                        padding:"4px 10px", fontSize:11, fontWeight:700,
+                        background:"#1a3a22", color:"#3fb950",
+                        border:"1px solid #3fb950", borderRadius:6, cursor:"pointer" }}>
+                      {r.kmh} km/h
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {!connected && <div style={{textAlign:"center", color:"#484f58", fontSize:12, padding:"16px 0"}}>Zuerst verbinden</div>}
+          </div>
+        )}
+
+        {tab === "custom" && (
+          <div>
+            <div style={{ background:"#161b22", border:"1px solid #30363d", borderRadius:14,
+              padding:"20px 18px", marginBottom:12, textAlign:"center" }}>
+              <div style={{fontSize:10, color:"#484f58", letterSpacing:2, textTransform:"uppercase", marginBottom:4}}>Geschwindigkeit</div>
+              <div style={{fontSize:56, fontWeight:900, color:"#f0883e", lineHeight:1}}>{speed}</div>
+              <div style={{fontSize:13, color:"#8b949e", marginBottom:12}}>km/h</div>
+              <input type="range" min={15} max={45} value={speed}
+                onChange={e => { setSpeed(+e.target.value); setActivePreset(null); }}
+                style={{width:"100%", accentColor:"#f0883e"}} />
+              <div style={{fontSize:10, color:"#484f58", marginTop:6, fontFamily:"monospace"}}>
+                → FF 02 {kmhToRaw(speed).toString(16).toUpperCase().padStart(2,"0")} 02
+              </div>
+            </div>
+            <button onClick={applyCustom} disabled={!connected||busy} style={{
+              width:"100%", padding:"14px 0", fontSize:15, fontWeight:800,
+              background:connected?"#1f6feb":"#21262d",
+              color:connected?"#fff":"#484f58",
+              border:`2px solid ${connected?"#388bfd":"#30363d"}`,
+              borderRadius:12, cursor:(!connected||busy)?"not-allowed":"pointer" }}>
+              {busy?"⏳ Wird gesetzt...":`✓ Setzen: ${speed} km/h`}
+            </button>
+          </div>
+        )}
+
+        {tab === "info" && (
+          <div>
+            <div style={{ background:"#1a1000", border:"2px solid #e3b341", borderRadius:12,
+              padding:"14px 16px", marginBottom:12 }}>
+              <div style={{fontSize:13, fontWeight:800, color:"#e3b341", marginBottom:8}}>📡 Dreame Protokoll</div>
+              <div style={{fontSize:11, color:"#b08800", lineHeight:1.8, fontFamily:"monospace"}}>
+                <div>SENDEN:  FF 02 &lt;value&gt; 02</div>
+                <div>ACK:     FF 02 55 02  ✅</div>
+                <div>NACK:    FF 02 FF 02  ❌</div>
+                <div style={{marginTop:8, color:"#8b6600"}}>Mi-Protokoll (55 AA) wird ignoriert!</div>
+              </div>
+            </div>
+            {gattInfo.length > 0 && (
+              <div style={{ background:"#0d2016", border:"1px solid #3fb950", borderRadius:12,
+                padding:"14px 16px", marginBottom:12 }}>
+                <div style={{fontSize:12, fontWeight:700, color:"#3fb950", marginBottom:10}}>✅ Gerät (BLE Chip)</div>
+                {gattInfo.map((row,i) => (
+                  <div key={i} style={{display:"flex", gap:8, padding:"5px 0",
+                    borderBottom:i<gattInfo.length-1?"1px solid #1a3a22":"none"}}>
+                    <span style={{color:"#484f58", fontSize:11, minWidth:90}}>{row.label}</span>
+                    <span style={{color:"#e6edf3", fontSize:12, fontWeight:700, fontFamily:"monospace"}}>{row.value}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {sweepResult.length > 0 && (
+              <div style={{ background:"#0d1a2e", border:"1px solid #1f6feb", borderRadius:12,
+                padding:"14px 16px", marginBottom:12 }}>
+                <div style={{fontSize:12, fontWeight:700, color:"#58a6ff", marginBottom:10}}>🎯 Sweep-Ergebnis</div>
+                {sweepResult.map((r,i) => (
+                  <div key={i} style={{display:"flex", justifyContent:"space-between",
+                    padding:"4px 0", borderBottom:i<sweepResult.length-1?"1px solid #1a2a3a":"none"}}>
+                    <span style={{color:"#484f58", fontFamily:"monospace", fontSize:11}}>0x{r.raw.toString(16).toUpperCase()}</span>
+                    <span style={{color:"#3fb950", fontSize:12, fontWeight:700}}>{r.kmh} km/h ✅</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ background:"#161b22", border:"1px solid #21262d", borderRadius:10,
+              padding:"12px 14px", fontSize:11, color:"#8b949e", lineHeight:1.8 }}>
+              <div style={{fontWeight:700, color:"#e6edf3", marginBottom:6}}>Nächste Schritte</div>
+              <div>1. Dev-Tab → Smart Sweep starten</div>
+              <div>2. Sweep zeigt ACK-Werte</div>
+              <div>3. Modi-Tab → Preset antippen</div>
+            </div>
+          </div>
+        )}
+
+        {tab === "dev" && (
+          <div>
+            <div style={{fontSize:11, color:"#8b949e", marginBottom:6, fontWeight:600}}>Direkt-Befehle</div>
+            <div style={{display:"flex", flexWrap:"wrap", gap:5, marginBottom:10}}>
+              {[["Status","FF 02 55 02"],["25km/h",`FF 02 ${kmhToRaw(25).toString(16).toUpperCase().padStart(2,"0")} 02`],
+                ["33km/h",`FF 02 ${kmhToRaw(33).toString(16).toUpperCase().padStart(2,"0")} 02`],
+                ["38km/h",`FF 02 ${kmhToRaw(38).toString(16).toUpperCase().padStart(2,"0")} 02`],
+                ["Read","FF 01 00 00"],["0x64","FF 02 64 02"],["0x78","FF 02 78 02"]
+              ].map(([l,h]) => (
+                <button key={l} onClick={() => setHexInput(h as string)} style={{
+                  padding:"5px 10px", fontSize:11, background:"#21262d", color:"#8b949e",
+                  border:"1px solid #30363d", borderRadius:6, cursor:"pointer"}}>{l}</button>
+              ))}
+            </div>
+            <div style={{display:"flex", gap:8, marginBottom:10}}>
+              <input value={hexInput} onChange={e => setHexInput(e.target.value)}
+                style={{flex:1, background:"#010409", border:"1px solid #30363d", color:"#e6edf3",
+                  borderRadius:8, padding:"9px 12px", fontSize:12, fontFamily:"monospace"}} />
+              <button onClick={sendHex} disabled={!connected||busy} style={{
+                padding:"9px 14px", fontSize:12, fontWeight:700,
+                background:"#1f6feb", color:"#fff", border:"2px solid #388bfd",
+                borderRadius:8, cursor:(!connected||busy)?"not-allowed":"pointer"}}>Send</button>
+            </div>
+            <div style={{display:"flex", gap:6, marginBottom:14}}>
+              <button onClick={doSweep} disabled={!connected||busy} style={tb("#1a1a2e","#6e40c9","#bc8cff",!connected||busy)}>🔍 Sweep</button>
+              <button onClick={registerScan} disabled={!connected||busy} style={tb("#1a2e1a","#238636","#3fb950",!connected||busy)}>📖 Reg-Scan</button>
+              <button onClick={monitor} disabled={!connected||busy} style={tb("#1a2028","#1f6feb","#58a6ff",!connected||busy)}>👂 Monitor</button>
+            </div>
+            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:5}}>
+              <div style={{fontSize:11, color:"#8b949e", fontWeight:600}}>BLE Log</div>
+              <button onClick={() => setLog([])} style={{fontSize:10, color:"#484f58", background:"none", border:"none", cursor:"pointer"}}>Leeren</button>
+            </div>
+            <div style={{background:"#010409", border:"1px solid #21262d", borderRadius:10,
+              padding:"8px 10px", maxHeight:340, overflowY:"auto", minHeight:60}}>
+              {!log.length && <div style={{color:"#484f58", fontSize:11, textAlign:"center", padding:"20px 0"}}>Log leer</div>}
+              {log.map((l,i) => (
+                <div key={i} style={{fontSize:11, lineHeight:1.8, fontFamily:"monospace", wordBreak:"break-all",
+                  color:l.type==="rx"?"#bc8cff":l.type==="tx"?"#58a6ff":l.type==="ok"?"#3fb950":l.type==="err"?"#f85149":l.type==="warn"?"#e3b341":"#8b949e"
+                }}>{l.text}</div>
+              ))}
+              <div ref={logEndRef} />
+            </div>
+          </div>
+        )}
+
+        {tab !== "dev" && log.length > 0 && (
+          <button onClick={() => setTab("dev")} style={{
+            width:"100%", padding:"7px 0", fontSize:11, color:"#484f58",
+            background:"none", border:"1px dashed #21262d", borderRadius:8,
+            cursor:"pointer", marginTop:10 }}>🔧 {log.length} Log-Einträge → Dev</button>
+        )}
+      </div>
+      <style>{`button{font-family:inherit} input[type=range]{height:4px}`}</style>
+    </div>
+  );
+}
+
+function tb(bg:string,brd:string,col:string,dis:boolean): React.CSSProperties {
+  return {flex:1,padding:"10px 0",fontSize:11,fontWeight:700,
+    background:bg,color:col,border:`2px solid ${brd}`,borderRadius:9,
+    cursor:dis?"not-allowed":"pointer"};
+}
